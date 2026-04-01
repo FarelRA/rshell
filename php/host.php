@@ -19,66 +19,75 @@ $lastRegister = 0.0;
 $lastKeepalive = 0.0;
 $running = true;
 
-function quote_sh(string $value): string {
-    return "'" . str_replace("'", "'\\''", $value) . "'";
-}
-
-function shell_bootstrap(array $session, string $shell): string {
-    $term = $session['term'] ?? 'xterm-256color';
-    $cols = (int) ($session['cols'] ?? 80);
-    $rows = (int) ($session['rows'] ?? 24);
-    return "export TERM=" . quote_sh($term) . " TERM_PROGRAM='rshell-php-host' TERMINAL='rshell-php-host'; stty cols {$cols} rows {$rows} 2>/dev/null || true; exec " . quote_sh($shell) . " -i";
-}
-
 function close_session(&$sessions, $socket, string $id, string $reason = 'close'): void {
     if (!isset($sessions[$id]) || $sessions[$id]['closed']) {
         return;
     }
     $sessions[$id]['closed'] = true;
     @send_json($socket, $sessions[$id]['peer'], ['type' => 'close', 'session' => $id, 'token' => $sessions[$id]['token'], 'reason' => $reason]);
-    foreach (($sessions[$id]['pipes'] ?? []) as $pipe) {
-        @fclose($pipe);
+    if (!empty($sessions[$id]['master_stream'])) {
+        @fclose($sessions[$id]['master_stream']);
     }
-    if (isset($sessions[$id]['proc']) && is_resource($sessions[$id]['proc'])) {
-        @proc_terminate($sessions[$id]['proc'], 9);
+    if (isset($sessions[$id]['master_fd'])) {
+        native_close_fd((int) $sessions[$id]['master_fd']);
     }
-}
-
-function start_shell(&$sessions, $socket, string $id, string $shell): void {
-    if (!isset($sessions[$id]) || $sessions[$id]['active'] || $sessions[$id]['closed']) {
-        return;
+    if (!empty($sessions[$id]['child_pid'])) {
+        native_kill_pid((int) $sessions[$id]['child_pid']);
     }
-    $desc = [
-        0 => ['pipe', 'r'],
-        1 => ['pipe', 'w'],
-        2 => ['pipe', 'w'],
-    ];
-    $proc = proc_open(['script', '-qefc', shell_bootstrap($sessions[$id], $shell), '/dev/null'], $desc, $pipes);
-    if (!is_resource($proc)) {
-        return;
-    }
-    foreach ($pipes as $pipe) {
-        stream_set_blocking($pipe, false);
-    }
-    $sessions[$id]['proc'] = $proc;
-    $sessions[$id]['pipes'] = $pipes;
-    $sessions[$id]['active'] = true;
-}
-
-function apply_resize(&$sessions, string $id): void {
-    if (empty($sessions[$id]['pipes'][0])) {
-        return;
-    }
-    $cols = (int) ($sessions[$id]['cols'] ?? 80);
-    $rows = (int) ($sessions[$id]['rows'] ?? 24);
-    @fwrite($sessions[$id]['pipes'][0], "stty cols {$cols} rows {$rows} 2>/dev/null\n");
-    @fflush($sessions[$id]['pipes'][0]);
 }
 
 function capture_terminal(&$session, array $msg): void {
     if (!empty($msg['term'])) $session['term'] = $msg['term'];
     if (!empty($msg['cols'])) $session['cols'] = (int) $msg['cols'];
     if (!empty($msg['rows'])) $session['rows'] = (int) $msg['rows'];
+}
+
+function apply_resize(&$sessions, string $id): void {
+    if (empty($sessions[$id]['master_fd'])) {
+        return;
+    }
+    native_set_winsize((int) $sessions[$id]['master_fd'], (int) ($sessions[$id]['cols'] ?? 80), (int) ($sessions[$id]['rows'] ?? 24));
+}
+
+function start_shell(&$sessions, $socket, string $id, string $shell): void {
+    if (!isset($sessions[$id]) || $sessions[$id]['active'] || $sessions[$id]['closed']) {
+        return;
+    }
+    $pty = native_openpty((int) ($sessions[$id]['cols'] ?? 80), (int) ($sessions[$id]['rows'] ?? 24));
+    if ($pty === null) {
+        return;
+    }
+    $pid = pcntl_fork();
+    if ($pid === -1) {
+        native_close_fd($pty['master_fd']);
+        native_close_fd($pty['slave_fd']);
+        return;
+    }
+    if ($pid === 0) {
+        native_close_fd($pty['master_fd']);
+        if (!native_login_tty($pty['slave_fd'])) {
+            exit(1);
+        }
+        putenv('TERM=' . ($sessions[$id]['term'] ?? 'xterm-256color'));
+        putenv('TERM_PROGRAM=rshell-php-host');
+        putenv('TERMINAL=rshell-php-host');
+        pcntl_exec($shell, ['-i']);
+        exit(1);
+    }
+
+    native_close_fd($pty['slave_fd']);
+    $masterStream = @fopen('php://fd/' . $pty['master_fd'], 'r+');
+    if ($masterStream === false) {
+        native_kill_pid($pid);
+        native_close_fd($pty['master_fd']);
+        return;
+    }
+    stream_set_blocking($masterStream, false);
+
+    $sessions[$id]['child_pid'] = $pid;
+    $sessions[$id]['master_fd'] = $pty['master_fd'];
+    $sessions[$id]['master_stream'] = $masterStream;
+    $sessions[$id]['active'] = true;
 }
 
 function send_register($socket, string $service, array $rdv): void {
@@ -146,9 +155,9 @@ while ($running) {
                     start_shell($sessions, $socket, $id, $shell);
                 } elseif ($type === 'stdin') {
                     start_shell($sessions, $socket, $id, $shell);
-                    if (isset($sessions[$id]['pipes'][0])) {
-                        @fwrite($sessions[$id]['pipes'][0], decode_data($msg['data'] ?? ''));
-                        @fflush($sessions[$id]['pipes'][0]);
+                    if (!empty($sessions[$id]['master_stream'])) {
+                        @fwrite($sessions[$id]['master_stream'], decode_data($msg['data'] ?? ''));
+                        @fflush($sessions[$id]['master_stream']);
                     }
                 } elseif ($type === 'resize') {
                     capture_terminal($sessions[$id], $msg);
@@ -168,20 +177,15 @@ while ($running) {
             @send_json($socket, $sessions[$id]['peer'], ['type' => 'punch', 'session' => $id, 'token' => $sessions[$id]['token']]);
             @send_json($socket, $sessions[$id]['peer'], ['type' => 'hello', 'session' => $id, 'token' => $sessions[$id]['token'], 'role' => 'host']);
         }
-        foreach ([1, 2] as $pipeIndex) {
-            if (!empty($sessions[$id]['pipes'][$pipeIndex])) {
-                $chunk = @fread($sessions[$id]['pipes'][$pipeIndex], 4096);
-                if ($chunk !== false && $chunk !== '') {
-                    @send_json($socket, $sessions[$id]['peer'], ['type' => 'stdout', 'session' => $id, 'token' => $sessions[$id]['token'], 'data' => encode_data($chunk)]);
-                }
+        if (!empty($sessions[$id]['master_stream'])) {
+            $chunk = @fread($sessions[$id]['master_stream'], 4096);
+            if ($chunk !== false && $chunk !== '') {
+                @send_json($socket, $sessions[$id]['peer'], ['type' => 'stdout', 'session' => $id, 'token' => $sessions[$id]['token'], 'data' => encode_data($chunk)]);
             }
         }
-        if (!empty($sessions[$id]['proc']) && is_resource($sessions[$id]['proc'])) {
-            $status = proc_get_status($sessions[$id]['proc']);
-            if (!$status['running']) {
-                close_session($sessions, $socket, $id, 'shell_exit');
-                unset($sessions[$id]);
-            }
+        if (!empty($sessions[$id]['child_pid']) && native_waitpid((int) $sessions[$id]['child_pid'])) {
+            close_session($sessions, $socket, $id, 'shell_exit');
+            unset($sessions[$id]);
         }
     }
 

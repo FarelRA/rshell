@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import process from "node:process";
+import { spawn as spawnPty } from "bun-pty";
 import { createSocket, decodeData, decodeJson, parseHostPort, PUNCH_EVERY_MS, PUNCH_TIMEOUT_MS, REGISTER_EVERY_MS, KEEPALIVE_EVERY_MS, SESSION_TIMEOUT_MS, sendJson, encodeData } from "./common.js";
 
 process.title = "rshell-bun-host";
@@ -25,58 +25,61 @@ async function register() {
   });
 }
 
-function shellBootstrap(session) {
-  const term = session.term || "xterm-256color";
-  const cols = session.cols || 80;
-  const rows = session.rows || 24;
-  return `export TERM=${quote(term)} TERM_PROGRAM='rshell-bun-host' TERMINAL='rshell-bun-host'; stty cols ${cols} rows ${rows} 2>/dev/null || true; exec ${quote(shell)} -i`;
-}
-
-function quote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
 function closeSession(session, reason = "close") {
   if (!session || session.closed) {
     return;
   }
   session.closed = true;
   clearInterval(session.punchTimer);
+  session.outputSub?.dispose?.();
+  session.exitSub?.dispose?.();
   sendJson(socket, session.peer.port, session.peer.host, { type: "close", session: session.id, token: session.token, reason }).catch(() => {});
-  session.child?.kill("SIGKILL");
-}
-
-function applyResize(session) {
-  if (!session.child?.stdin || !session.rows || !session.cols) {
-    return;
+  try {
+    session.pty?.kill?.("SIGKILL");
+  } catch {
   }
-  session.child.stdin.write(`stty cols ${session.cols} rows ${session.rows} 2>/dev/null\n`);
 }
 
 function startShell(session) {
   if (session.active || session.closed) {
     return;
   }
-  const child = spawn("script", ["-qefc", shellBootstrap(session), "/dev/null"], { stdio: ["pipe", "pipe", "pipe"] });
-  child.stdout.on("data", (chunk) => {
+  const pty = spawnPty(shell, ["-i"], {
+    name: session.term || "xterm-256color",
+    cols: session.cols || 80,
+    rows: session.rows || 24,
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      TERM: session.term || "xterm-256color",
+      TERM_PROGRAM: "rshell-bun-host",
+      TERMINAL: "rshell-bun-host"
+    }
+  });
+  session.outputSub = pty.onData((data) => {
     sendJson(socket, session.peer.port, session.peer.host, {
       type: "stdout",
       session: session.id,
       token: session.token,
-      data: encodeData(chunk)
+      data: encodeData(Buffer.from(data, "utf8"))
     }).catch(() => {});
   });
-  child.stderr.on("data", (chunk) => {
-    sendJson(socket, session.peer.port, session.peer.host, {
-      type: "stdout",
-      session: session.id,
-      token: session.token,
-      data: encodeData(chunk)
-    }).catch(() => {});
+  session.exitSub = pty.onExit(() => {
+    closeSession(session, "shell_exit");
+    sessions.delete(session.id);
   });
-  child.on("exit", () => closeSession(session, "shell_exit"));
-  session.child = child;
+  session.pty = pty;
   session.active = true;
+}
+
+function applyResize(session) {
+  if (!session.pty || !session.rows || !session.cols) {
+    return;
+  }
+  try {
+    session.pty.resize(session.cols, session.rows);
+  } catch {
+  }
 }
 
 function captureTerminal(session, msg) {
@@ -124,7 +127,10 @@ socket.on("message", async (data) => {
         lastSeen: Date.now(),
         term: "xterm-256color",
         cols: 80,
-        rows: 24
+        rows: 24,
+        pty: null,
+        outputSub: null,
+        exitSub: null
       };
       session.punchTimer = setInterval(() => {
         if (session.closed || session.active || Date.now() - session.lastSeen > PUNCH_TIMEOUT_MS) {
@@ -157,7 +163,10 @@ socket.on("message", async (data) => {
       break;
     case "stdin":
       startShell(session);
-      session.child?.stdin.write(decodeData(msg.data));
+      try {
+        session.pty?.write?.(decodeData(msg.data).toString("utf8"));
+      } catch {
+      }
       break;
     case "keepalive":
       await sendJson(socket, session.peer.port, session.peer.host, { type: "keepalive", session: session.id, token: session.token }).catch(() => {});

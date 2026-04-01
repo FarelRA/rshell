@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/native.php';
+
 const VERSION = 1;
 const MAX_PACKET_SIZE = 65535;
 const KEEPALIVE_EVERY = 5.0;
@@ -54,8 +56,8 @@ function decode_data(string $data): string {
     return $data === '' ? '' : (base64_decode($data, true) ?: '');
 }
 
-function terminal_info(string $fallback): array {
-    [$cols, $rows] = terminal_size();
+function terminal_info(string $fallback, ?int $fd = null): array {
+    [$cols, $rows] = terminal_size($fd);
     return [
         'term' => getenv('TERM') ?: 'xterm-256color',
         'term_program' => getenv('TERM_PROGRAM') ?: $fallback,
@@ -65,7 +67,13 @@ function terminal_info(string $fallback): array {
     ];
 }
 
-function terminal_size(): array {
+function terminal_size(?int $fd = null): array {
+    if ($fd !== null) {
+        $native = native_get_winsize($fd);
+        if ($native !== null) {
+            return $native;
+        }
+    }
     $size = trim((string) @shell_exec('stty size < /dev/tty 2>/dev/null'));
     if ($size !== '') {
         [$rows, $cols] = array_map('intval', preg_split('/\s+/', $size));

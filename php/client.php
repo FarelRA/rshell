@@ -20,48 +20,46 @@ $lastPunch = 0.0;
 $lastKeepalive = 0.0;
 $punchUntil = 0.0;
 
-$sttyState = null;
-if (function_exists('shell_exec') && function_exists('posix_isatty') && posix_isatty(STDIN)) {
-    $sttyState = trim((string) shell_exec('stty -g < /dev/tty 2>/dev/null'));
-    @shell_exec('stty raw -echo < /dev/tty 2>/dev/null');
-}
+$tty = native_open_tty();
+$inputStream = $tty['stream'] ?? STDIN;
+$ttyFd = $tty['fd'] ?? null;
+$rawState = $ttyFd !== null ? native_terminal_make_raw($ttyFd) : null;
+stream_set_blocking($inputStream, false);
 
-function restore_terminal(?string $state): void {
-    if ($state !== null) {
-        @shell_exec('stty ' . escapeshellarg($state) . ' < /dev/tty 2>/dev/null');
+function restore_terminal(?int $ttyFd, ?string $state): void {
+    if ($ttyFd !== null) {
+        native_terminal_restore($ttyFd, $state);
     }
 }
 
-function close_client($socket, ?array $peer, ?string $sessionId, ?string $token, string $reason, ?string $sttyState): void {
+function close_client($socket, ?array $peer, ?string $sessionId, ?string $token, string $reason, ?int $ttyFd, ?string $rawState): void {
     if ($peer && $sessionId && $token) {
         @send_json($socket, $peer, ['type' => 'close', 'session' => $sessionId, 'token' => $token, 'reason' => $reason]);
     }
-    restore_terminal($sttyState);
+    restore_terminal($ttyFd, $rawState);
     exit(0);
 }
 
-function hello_message(?string $sessionId, ?string $token): array {
-    return ['type' => 'hello', 'session' => $sessionId, 'token' => $token, 'role' => 'client'] + terminal_info('rshell-php-client');
+function hello_message(?string $sessionId, ?string $token, ?int $ttyFd): array {
+    return ['type' => 'hello', 'session' => $sessionId, 'token' => $token, 'role' => 'client'] + terminal_info('rshell-php-client', $ttyFd);
 }
 
-function resize_message(?string $sessionId, ?string $token): array {
-    return ['type' => 'resize', 'session' => $sessionId, 'token' => $token] + terminal_info('rshell-php-client');
+function resize_message(?string $sessionId, ?string $token, ?int $ttyFd): array {
+    return ['type' => 'resize', 'session' => $sessionId, 'token' => $token] + terminal_info('rshell-php-client', $ttyFd);
 }
 
 pcntl_async_signals(true);
-pcntl_signal(SIGINT, function() use ($socket, &$peer, &$sessionId, &$token, $sttyState) {
-    close_client($socket, $peer, $sessionId, $token, 'signal', $sttyState);
+pcntl_signal(SIGINT, function() use ($socket, &$peer, &$sessionId, &$token, $ttyFd, $rawState) {
+    close_client($socket, $peer, $sessionId, $token, 'signal', $ttyFd, $rawState);
 });
-pcntl_signal(SIGTERM, function() use ($socket, &$peer, &$sessionId, &$token, $sttyState) {
-    close_client($socket, $peer, $sessionId, $token, 'signal', $sttyState);
+pcntl_signal(SIGTERM, function() use ($socket, &$peer, &$sessionId, &$token, $ttyFd, $rawState) {
+    close_client($socket, $peer, $sessionId, $token, 'signal', $ttyFd, $rawState);
 });
-pcntl_signal(SIGWINCH, function() use ($socket, &$peer, &$sessionId, &$token) {
+pcntl_signal(SIGWINCH, function() use ($socket, &$peer, &$sessionId, &$token, $ttyFd) {
     if ($peer && $sessionId && $token) {
-        @send_json($socket, $peer, resize_message($sessionId, $token));
+        @send_json($socket, $peer, resize_message($sessionId, $token, $ttyFd));
     }
 });
-
-stream_set_blocking(STDIN, false);
 
 while (true) {
     $now = microtime(true);
@@ -75,7 +73,7 @@ while (true) {
         if ($msg) {
             $type = $msg['type'] ?? '';
             if ($type === 'error') {
-                restore_terminal($sttyState);
+                restore_terminal($ttyFd, $rawState);
                 fwrite(STDERR, ($msg['code'] ?? 'error') . ': ' . ($msg['message'] ?? '') . PHP_EOL);
                 exit(1);
             }
@@ -84,13 +82,13 @@ while (true) {
                 $sessionId = $msg['session'];
                 $token = $msg['token'];
                 $punchUntil = $now + PUNCH_TIMEOUT;
-                @send_json($socket, $peer, resize_message($sessionId, $token));
+                @send_json($socket, $peer, resize_message($sessionId, $token, $ttyFd));
                 continue;
             }
             if ($sessionId && $token && ($msg['session'] ?? '') === $sessionId && ($msg['token'] ?? '') === $token) {
                 $lastSeen = $now;
                 if ($type === 'punch') {
-                    @send_json($socket, $peer, hello_message($sessionId, $token));
+                    @send_json($socket, $peer, hello_message($sessionId, $token, $ttyFd));
                 } elseif ($type === 'hello' || $type === 'hello_ack') {
                     $active = true;
                     @send_json($socket, $peer, ['type' => 'hello_ack', 'session' => $sessionId, 'token' => $token]);
@@ -99,7 +97,7 @@ while (true) {
                 } elseif ($type === 'keepalive') {
                     @send_json($socket, $peer, ['type' => 'keepalive', 'session' => $sessionId, 'token' => $token]);
                 } elseif ($type === 'close') {
-                    close_client($socket, $peer, $sessionId, $token, $msg['reason'] ?? 'peer_close', $sttyState);
+                    close_client($socket, $peer, $sessionId, $token, $msg['reason'] ?? 'peer_close', $ttyFd, $rawState);
                 }
             }
         }
@@ -107,20 +105,20 @@ while (true) {
 
     if ($peer && $sessionId && $token && !$active && $now <= $punchUntil && $now - $lastPunch >= PUNCH_EVERY) {
         @send_json($socket, $peer, ['type' => 'punch', 'session' => $sessionId, 'token' => $token]);
-        @send_json($socket, $peer, hello_message($sessionId, $token));
+        @send_json($socket, $peer, hello_message($sessionId, $token, $ttyFd));
         $lastPunch = $now;
     }
     if ($peer && $sessionId && $token && $now - $lastKeepalive >= KEEPALIVE_EVERY) {
         if ($now - $lastSeen > SESSION_TIMEOUT) {
             fwrite(STDERR, "session timeout" . PHP_EOL);
-            close_client($socket, $peer, $sessionId, $token, 'timeout', $sttyState);
+            close_client($socket, $peer, $sessionId, $token, 'timeout', $ttyFd, $rawState);
         }
         @send_json($socket, $peer, ['type' => 'keepalive', 'session' => $sessionId, 'token' => $token]);
         $lastKeepalive = $now;
     }
 
     if ($peer && $sessionId && $token) {
-        $chunk = @fread(STDIN, 4096);
+        $chunk = @fread($inputStream, 4096);
         if ($chunk !== false && $chunk !== '') {
             @send_json($socket, $peer, ['type' => 'stdin', 'session' => $sessionId, 'token' => $token, 'data' => encode_data($chunk)]);
         }
