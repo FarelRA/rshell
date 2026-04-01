@@ -15,11 +15,31 @@ function parse_host_port(string $value): array {
     return [$host, $port];
 }
 
+function create_udp_socket(string $listen): mixed {
+    [$host, $port] = parse_host_port($listen);
+    $socket = @stream_socket_server("udp://{$host}:{$port}", $errno, $errstr, STREAM_SERVER_BIND);
+    if ($socket === false) {
+        fwrite(STDERR, "failed to bind UDP socket: {$errstr} ({$errno})" . PHP_EOL);
+        exit(1);
+    }
+    stream_set_blocking($socket, false);
+    return $socket;
+}
+
 function send_json($socket, array $addr, array $msg): void {
     $msg['v'] = VERSION;
     $msg['ts'] = (int) round(microtime(true) * 1000);
     $payload = json_encode($msg, JSON_UNESCAPED_SLASHES);
-    socket_sendto($socket, $payload, strlen($payload), 0, $addr[0], $addr[1]);
+    @stream_socket_sendto($socket, $payload, 0, "{$addr[0]}:{$addr[1]}");
+}
+
+function recv_packet($socket): ?array {
+    $peer = null;
+    $data = @stream_socket_recvfrom($socket, MAX_PACKET_SIZE, 0, $peer);
+    if ($data === false || $data === '') {
+        return null;
+    }
+    return ['data' => $data, 'peer' => $peer];
 }
 
 function recv_json(string $data): array {
@@ -31,5 +51,25 @@ function encode_data(string $data): string {
 }
 
 function decode_data(string $data): string {
-    return $data === '' ? '' : base64_decode($data, true);
+    return $data === '' ? '' : (base64_decode($data, true) ?: '');
+}
+
+function terminal_info(string $fallback): array {
+    [$cols, $rows] = terminal_size();
+    return [
+        'term' => getenv('TERM') ?: 'xterm-256color',
+        'term_program' => getenv('TERM_PROGRAM') ?: $fallback,
+        'terminal' => getenv('TERMINAL') ?: $fallback,
+        'cols' => $cols,
+        'rows' => $rows,
+    ];
+}
+
+function terminal_size(): array {
+    $size = trim((string) @shell_exec('stty size < /dev/tty 2>/dev/null'));
+    if ($size !== '') {
+        [$rows, $cols] = array_map('intval', preg_split('/\s+/', $size));
+        return [$cols, $rows];
+    }
+    return [0, 0];
 }

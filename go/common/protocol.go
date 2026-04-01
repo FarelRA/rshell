@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net"
+	"os"
 	"time"
 )
 
@@ -73,4 +74,25 @@ func DecodeData(s string) []byte {
 		return nil
 	}
 	return b
+}
+
+func TerminalInfo() Message {
+	cols, rows := 0, 0
+	if size, err := GetTerminalSize(); err == nil {
+		cols, rows = size[0], size[1]
+	}
+	return Message{
+		"term":         envOrDefault("TERM", "xterm-256color"),
+		"term_program": envOrDefault("TERM_PROGRAM", "rshell"),
+		"terminal":     envOrDefault("TERMINAL", "rshell"),
+		"cols":         cols,
+		"rows":         rows,
+	}
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }

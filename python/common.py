@@ -1,7 +1,11 @@
 import base64
+import fcntl
 import json
 import socket
+import struct
+import termios
 import time
+import os
 
 VERSION = 1
 MAX_PACKET_SIZE = 64 * 1024
@@ -34,3 +38,30 @@ def encode_data(data):
 
 def decode_data(value):
     return base64.b64decode(value.encode("ascii")) if value else b""
+
+
+def terminal_info():
+    cols, rows = get_terminal_size()
+    return {
+        "term": os.environ.get("TERM", "xterm-256color"),
+        "term_program": os.environ.get("TERM_PROGRAM", "rshell-python-client"),
+        "terminal": os.environ.get("TERMINAL", "rshell-python-client"),
+        "cols": cols,
+        "rows": rows,
+    }
+
+
+def get_terminal_size():
+    for fd in (1, 0):
+        try:
+            cols, rows = os.get_terminal_size(fd)
+            return cols, rows
+        except OSError:
+            continue
+    return 0, 0
+
+
+def set_winsize(fd, rows, cols):
+    if fd is None or rows <= 0 or cols <= 0:
+        return
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))

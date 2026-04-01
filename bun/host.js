@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
+import process from "node:process";
 import { createSocket, decodeData, decodeJson, parseHostPort, PUNCH_EVERY_MS, PUNCH_TIMEOUT_MS, REGISTER_EVERY_MS, KEEPALIVE_EVERY_MS, SESSION_TIMEOUT_MS, sendJson, encodeData } from "./common.js";
+
+process.title = "rshell-bun-host";
 
 const args = new Map(process.argv.slice(2).map((arg) => {
   const [k, v] = arg.split("=", 2);
@@ -22,26 +25,48 @@ async function register() {
   });
 }
 
+function shellBootstrap(session) {
+  const term = session.term || "xterm-256color";
+  const cols = session.cols || 80;
+  const rows = session.rows || 24;
+  return `export TERM=${quote(term)} TERM_PROGRAM='rshell-bun-host' TERMINAL='rshell-bun-host'; stty cols ${cols} rows ${rows} 2>/dev/null || true; exec ${quote(shell)} -i`;
+}
+
+function quote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 function closeSession(session, reason = "close") {
   if (!session || session.closed) {
     return;
   }
   session.closed = true;
   clearInterval(session.punchTimer);
-  if (session.keepaliveTimer) {
-    clearInterval(session.keepaliveTimer);
-  }
   sendJson(socket, session.peer.port, session.peer.host, { type: "close", session: session.id, token: session.token, reason }).catch(() => {});
   session.child?.kill("SIGKILL");
+}
+
+function applyResize(session) {
+  if (!session.child?.stdin || !session.rows || !session.cols) {
+    return;
+  }
+  session.child.stdin.write(`stty cols ${session.cols} rows ${session.rows} 2>/dev/null\n`);
 }
 
 function startShell(session) {
   if (session.active || session.closed) {
     return;
   }
-  const child = spawn("script", ["-qfc", `${shell} -i`, "/dev/null"], { stdio: ["pipe", "pipe", "pipe"] });
-  child.stderr.pipe(child.stdout);
+  const child = spawn("script", ["-qefc", shellBootstrap(session), "/dev/null"], { stdio: ["pipe", "pipe", "pipe"] });
   child.stdout.on("data", (chunk) => {
+    sendJson(socket, session.peer.port, session.peer.host, {
+      type: "stdout",
+      session: session.id,
+      token: session.token,
+      data: encodeData(chunk)
+    }).catch(() => {});
+  });
+  child.stderr.on("data", (chunk) => {
     sendJson(socket, session.peer.port, session.peer.host, {
       type: "stdout",
       session: session.id,
@@ -52,6 +77,12 @@ function startShell(session) {
   child.on("exit", () => closeSession(session, "shell_exit"));
   session.child = child;
   session.active = true;
+}
+
+function captureTerminal(session, msg) {
+  if (msg.term) session.term = msg.term;
+  if (msg.cols) session.cols = msg.cols;
+  if (msg.rows) session.rows = msg.rows;
 }
 
 await register();
@@ -71,7 +102,7 @@ setInterval(() => {
   }
 }, KEEPALIVE_EVERY_MS);
 
-socket.on("message", async (data, remote) => {
+socket.on("message", async (data) => {
   let msg;
   try {
     msg = decodeJson(data);
@@ -90,7 +121,10 @@ socket.on("message", async (data, remote) => {
         peer,
         active: false,
         closed: false,
-        lastSeen: Date.now()
+        lastSeen: Date.now(),
+        term: "xterm-256color",
+        cols: 80,
+        rows: 24
       };
       session.punchTimer = setInterval(() => {
         if (session.closed || session.active || Date.now() - session.lastSeen > PUNCH_TIMEOUT_MS) {
@@ -114,9 +148,12 @@ socket.on("message", async (data, remote) => {
       await sendJson(socket, session.peer.port, session.peer.host, { type: "hello", session: session.id, token: session.token, role: "host" }).catch(() => {});
       break;
     case "hello":
-    case "hello_ack":
+      captureTerminal(session, msg);
       startShell(session);
       await sendJson(socket, session.peer.port, session.peer.host, { type: "hello_ack", session: session.id, token: session.token }).catch(() => {});
+      break;
+    case "hello_ack":
+      startShell(session);
       break;
     case "stdin":
       startShell(session);
@@ -130,6 +167,8 @@ socket.on("message", async (data, remote) => {
       sessions.delete(session.id);
       break;
     case "resize":
+      captureTerminal(session, msg);
+      applyResize(session);
       break;
   }
 });

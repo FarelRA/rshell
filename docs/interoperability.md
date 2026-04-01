@@ -40,3 +40,9 @@ All host/client combinations are designed to interoperate as long as:
 - Syntax/build validation for Go, Bun, Python, and PHP implementations
 - Local automated `4 x 4` smoke matrix in `scripts/smoke_matrix.sh`
 - One shared Go rendezvous implementation used for every matrix run
+
+## Terminal behavior
+
+- Go and Python hosts use a real PTY and propagate window size changes directly.
+- Bun and PHP hosts keep compatibility with the same protocol and apply window size through shell-side `stty` updates.
+- Hosts brand the remote terminal process and terminal environment as `rshell-<implementation>-host` where supported.

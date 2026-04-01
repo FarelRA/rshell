@@ -112,9 +112,16 @@ Peer authentication and session activation.
   "type": "hello",
   "session": "sess-...",
   "token": "randhex",
-  "role": "client"
+  "role": "client",
+  "term": "xterm-256color",
+  "term_program": "rshell-go-client",
+  "terminal": "rshell-go-client",
+  "cols": 120,
+  "rows": 40
 }
 ```
+
+The terminal metadata is advisory and lets the host shape the remote shell more symmetrically.
 
 ### `hello_ack`
 
@@ -172,7 +179,7 @@ Client to host terminal resize hint.
 }
 ```
 
-This version carries the resize event for forward compatibility. The `script`-based shell wrapper does not yet force PTY resize in every implementation.
+Go and Python hosts apply resize directly to the PTY. Bun and PHP hosts apply resize through a shell-side `stty` update.
 
 ### `keepalive`
 
@@ -217,3 +224,5 @@ Bidirectional session shutdown.
 - `data` payloads are base64 encoded raw bytes.
 - JSON object keys are case-sensitive.
 - All implementations must validate `v`, `session`, and `token` before processing session messages.
+- Clients should include terminal metadata in `hello` and `resize`.
+- Hosts should use the client `term` value but brand the remote terminal process as their own implementation.

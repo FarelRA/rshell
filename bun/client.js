@@ -1,6 +1,5 @@
-import { execFile } from "node:child_process";
 import process from "node:process";
-import { createSocket, decodeData, decodeJson, parseHostPort, PUNCH_EVERY_MS, PUNCH_TIMEOUT_MS, KEEPALIVE_EVERY_MS, SESSION_TIMEOUT_MS, sendJson, encodeData } from "./common.js";
+import { createSocket, decodeData, decodeJson, parseHostPort, PUNCH_EVERY_MS, PUNCH_TIMEOUT_MS, KEEPALIVE_EVERY_MS, SESSION_TIMEOUT_MS, sendJson, encodeData, terminalInfo } from "./common.js";
 
 const args = new Map(process.argv.slice(2).map((arg) => {
   const [k, v] = arg.split("=", 2);
@@ -19,6 +18,17 @@ let active = false;
 let lastSeen = Date.now();
 let closed = false;
 
+function helloMessage() {
+  return { type: "hello", session: sessionId, token, role: "client", ...terminalInfo() };
+}
+
+function sendResize() {
+  if (!peer || !sessionId || !token) {
+    return;
+  }
+  sendJson(socket, peer.port, peer.host, { type: "resize", session: sessionId, token, ...terminalInfo() }).catch(() => {});
+}
+
 function close(reason = "close") {
   if (closed) {
     return;
@@ -31,19 +41,6 @@ function close(reason = "close") {
     process.stdin.setRawMode(false);
   }
   process.exit(0);
-}
-
-function stty(args) {
-  return new Promise((resolve, reject) => {
-    const child = execFile("stty", args, { stdio: ["inherit", "pipe", "pipe"] }, (err, stdout) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(stdout.toString());
-    });
-    child.stdin?.end();
-  });
 }
 
 await sendJson(socket, rendezvous.port, rendezvous.host, { type: "connect_request", service, meta: { impl: "bun-client" } });
@@ -70,11 +67,12 @@ socket.on("message", async (data) => {
         return;
       }
       sendJson(socket, peer.port, peer.host, { type: "punch", session: sessionId, token }).catch(() => {});
-      sendJson(socket, peer.port, peer.host, { type: "hello", session: sessionId, token, role: "client" }).catch(() => {});
+      sendJson(socket, peer.port, peer.host, helloMessage()).catch(() => {});
     }, PUNCH_EVERY_MS);
 
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(true);
+      process.stdout.on("resize", sendResize);
     }
     process.stdin.resume();
     process.stdin.on("data", (chunk) => {
@@ -82,14 +80,7 @@ socket.on("message", async (data) => {
         sendJson(socket, peer.port, peer.host, { type: "stdin", session: sessionId, token, data: encodeData(chunk) }).catch(() => {});
       }
     });
-    try {
-      const size = await stty(["size"]);
-      const [rows, cols] = size.trim().split(/\s+/).map(Number);
-      if (rows && cols) {
-        await sendJson(socket, peer.port, peer.host, { type: "resize", session: sessionId, token, rows, cols }).catch(() => {});
-      }
-    } catch {
-    }
+    sendResize();
     return;
   }
   if (msg.session !== sessionId || msg.token !== token) {
@@ -98,7 +89,7 @@ socket.on("message", async (data) => {
   lastSeen = Date.now();
   switch (msg.type) {
     case "punch":
-      await sendJson(socket, peer.port, peer.host, { type: "hello", session: sessionId, token, role: "client" }).catch(() => {});
+      await sendJson(socket, peer.port, peer.host, helloMessage()).catch(() => {});
       break;
     case "hello":
     case "hello_ack":

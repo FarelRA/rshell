@@ -9,27 +9,33 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+	"unsafe"
 
+	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 	"rshell/go/common"
 )
 
 type session struct {
-	id          string
-	token       string
-	peer        *net.UDPAddr
-	active      bool
-	lastSeen    time.Time
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      io.ReadCloser
-	closed      bool
-	closeOnce   sync.Once
-	shutdownCh  chan struct{}
-	punchUntil  time.Time
-	punchTicker *time.Ticker
+	id         string
+	token      string
+	peer       *net.UDPAddr
+	active     bool
+	lastSeen   time.Time
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	ptyFile    *os.File
+	closed     bool
+	closeOnce  sync.Once
+	shutdownCh chan struct{}
+	punchUntil time.Time
+	term       string
+	cols       uint16
+	rows       uint16
 }
 
 func main() {
+	setProcessName("rshell-go-host")
 	rendezvous := flag.String("rendezvous", "127.0.0.1:4000", "rendezvous host:port")
 	service := flag.String("service", "demo-shell", "service name")
 	listen := flag.String("listen", ":0", "local UDP listen address")
@@ -113,8 +119,7 @@ func main() {
 			continue
 		}
 
-		typeName := common.String(msg, "type")
-		switch typeName {
+		switch common.String(msg, "type") {
 		case "register_ok":
 			log.Printf("registered service=%s public_addr=%s", *service, common.String(msg, "public_addr"))
 		case "connect_intro":
@@ -138,10 +143,11 @@ func main() {
 				continue
 			}
 			sess.lastSeen = time.Now()
-			switch typeName {
+			switch common.String(msg, "type") {
 			case "punch":
 				_ = common.SendJSON(conn, sess.peer, common.Message{"type": "hello", "session": sess.id, "token": sess.token, "role": "host"})
 			case "hello":
+				captureTerminal(sess, msg)
 				activateHostSession(conn, sess, *shell)
 				_ = common.SendJSON(conn, sess.peer, common.Message{"type": "hello_ack", "session": sess.id, "token": sess.token})
 			case "hello_ack":
@@ -154,7 +160,8 @@ func main() {
 			case "keepalive":
 				_ = common.SendJSON(conn, sess.peer, common.Message{"type": "keepalive", "session": sess.id, "token": sess.token})
 			case "resize":
-				// Resize is intentionally best-effort in this version.
+				captureTerminal(sess, msg)
+				resizeSession(sess)
 			case "close":
 				mu.Lock()
 				closeSession(conn, sess, common.String(msg, "reason"))
@@ -184,41 +191,48 @@ func punchLoop(conn *net.UDPConn, sess *session, role string) {
 	}
 }
 
+func captureTerminal(sess *session, msg common.Message) {
+	if term := common.String(msg, "term"); term != "" {
+		sess.term = term
+	}
+	if cols := common.Int(msg, "cols"); cols > 0 {
+		sess.cols = uint16(cols)
+	}
+	if rows := common.Int(msg, "rows"); rows > 0 {
+		sess.rows = uint16(rows)
+	}
+}
+
 func activateHostSession(conn *net.UDPConn, sess *session, shell string) {
 	if sess.active || sess.closed {
 		return
 	}
-	cmd := exec.Command("script", "-qfc", shell+" -i", "/dev/null")
-	stdin, err := cmd.StdinPipe()
+	cmd := exec.Command(shell, "-i")
+	cmd.Env = append(os.Environ(),
+		"TERM="+fallback(sess.term, "xterm-256color"),
+		"TERM_PROGRAM=rshell-go-host",
+		"TERMINAL=rshell-go-host",
+	)
+	ptyFile, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: atLeastOne(sess.cols), Rows: atLeastOne(sess.rows)})
 	if err != nil {
-		log.Printf("stdin pipe error: %v", err)
-		return
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Printf("stdout pipe error: %v", err)
-		return
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
 		log.Printf("shell start error: %v", err)
 		return
 	}
 	sess.active = true
 	sess.cmd = cmd
-	sess.stdin = stdin
-	sess.stdout = stdout
+	sess.stdin = ptyFile
+	sess.ptyFile = ptyFile
 
 	go func() {
 		buf := make([]byte, 4096)
 		for {
-			n, err := stdout.Read(buf)
+			n, err := ptyFile.Read(buf)
 			if n > 0 && !sess.closed {
 				_ = common.SendJSON(conn, sess.peer, common.Message{"type": "stdout", "session": sess.id, "token": sess.token, "data": common.EncodeData(buf[:n])})
 			}
 			if err != nil {
-				if err != io.EOF {
-					log.Printf("shell stdout error: %v", err)
+				if err != io.EOF && !sess.closed {
+					log.Printf("shell pty error: %v", err)
 				}
 				closeSession(conn, sess, "shell_exit")
 				return
@@ -227,11 +241,18 @@ func activateHostSession(conn *net.UDPConn, sess *session, shell string) {
 	}()
 
 	go func() {
-		if err := cmd.Wait(); err != nil {
+		if err := cmd.Wait(); err != nil && !sess.closed {
 			log.Printf("shell wait error: %v", err)
 		}
 		closeSession(conn, sess, "shell_exit")
 	}()
+}
+
+func resizeSession(sess *session) {
+	if sess == nil || sess.ptyFile == nil || sess.cols == 0 || sess.rows == 0 {
+		return
+	}
+	_ = pty.Setsize(sess.ptyFile, &pty.Winsize{Cols: atLeastOne(sess.cols), Rows: atLeastOne(sess.rows)})
 }
 
 func closeSession(conn *net.UDPConn, sess *session, reason string) {
@@ -245,11 +266,31 @@ func closeSession(conn *net.UDPConn, sess *session, reason string) {
 		if sess.stdin != nil {
 			_ = sess.stdin.Close()
 		}
-		if sess.stdout != nil {
-			_ = sess.stdout.Close()
+		if sess.ptyFile != nil {
+			_ = sess.ptyFile.Close()
 		}
 		if sess.cmd != nil && sess.cmd.Process != nil {
 			_ = sess.cmd.Process.Kill()
 		}
 	})
+}
+
+func fallback(value, defaultValue string) string {
+	if value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func atLeastOne(value uint16) uint16 {
+	if value == 0 {
+		return 1
+	}
+	return value
+}
+
+func setProcessName(name string) {
+	buf := make([]byte, 16)
+	copy(buf, []byte(name))
+	_ = unix.Prctl(unix.PR_SET_NAME, uintptr(unsafe.Pointer(&buf[0])), 0, 0, 0)
 }

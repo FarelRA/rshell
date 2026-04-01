@@ -1,4 +1,5 @@
 import dgram from "node:dgram";
+import process from "node:process";
 
 export const VERSION = 1;
 export const KEEPALIVE_EVERY_MS = 5000;
@@ -43,4 +44,14 @@ export function parseHostPort(value) {
     throw new Error(`invalid address: ${value}`);
   }
   return { host: value.slice(0, idx), port: Number(value.slice(idx + 1)) };
+}
+
+export function terminalInfo() {
+  return {
+    term: process.env.TERM || "xterm-256color",
+    term_program: process.env.TERM_PROGRAM || "rshell-bun-client",
+    terminal: process.env.TERMINAL || "rshell-bun-client",
+    cols: process.stdout.columns || 0,
+    rows: process.stdout.rows || 0
+  };
 }

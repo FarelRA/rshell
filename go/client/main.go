@@ -6,11 +6,12 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
 	"rshell/go/common"
 )
 
@@ -45,8 +46,10 @@ func main() {
 	active := false
 	lastSeen := time.Now()
 	done := make(chan struct{})
+	var doneOnce sync.Once
+	closeDone := func() { doneOnce.Do(func() { close(done) }) }
 
-	for !active {
+	for peer == nil {
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Fatalf("read intro: %v", err)
@@ -70,48 +73,48 @@ func main() {
 				for time.Now().Before(deadline) && !active {
 					<-ticker.C
 					_ = common.SendJSON(conn, peer, common.Message{"type": "punch", "session": sessionID, "token": token})
-					_ = common.SendJSON(conn, peer, common.Message{"type": "hello", "session": sessionID, "token": token, "role": "client"})
+					_ = common.SendJSON(conn, peer, helloMessage(sessionID, token))
 				}
 			}()
 		case "error":
 			log.Fatalf("server error code=%s message=%s", common.String(msg, "code"), common.String(msg, "message"))
 		}
+	}
 
-		if peer != nil {
-			break
+	var rawState *term.State
+	if common.IsTerminal() {
+		rawState, err = common.MakeRaw()
+		if err != nil {
+			log.Printf("raw mode unavailable: %v", err)
 		}
 	}
-
-	if peer == nil {
-		log.Fatal("no peer introduction received")
-	}
-
-	restore, err := setRawMode()
-	if err != nil {
-		log.Printf("raw mode unavailable: %v", err)
-		restore = func() {}
-	}
-	defer restore()
+	defer func() { _ = common.RestoreTerminal(rawState) }()
 	sendResize(conn, peer, sessionID, token)
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 	go func() {
-		<-sigCh
-		_ = common.SendJSON(conn, peer, common.Message{"type": "close", "session": sessionID, "token": token, "reason": "signal"})
-		close(done)
+		for sig := range sigCh {
+			if sig == syscall.SIGWINCH {
+				sendResize(conn, peer, sessionID, token)
+				continue
+			}
+			_ = common.SendJSON(conn, peer, common.Message{"type": "close", "session": sessionID, "token": token, "reason": "signal"})
+			closeDone()
+			return
+		}
 	}()
 
 	go func() {
 		in := make([]byte, 4096)
 		for {
 			n, err := os.Stdin.Read(in)
-			if n > 0 && peer != nil {
+			if n > 0 {
 				_ = common.SendJSON(conn, peer, common.Message{"type": "stdin", "session": sessionID, "token": token, "data": common.EncodeData(in[:n])})
 			}
 			if err != nil {
 				_ = common.SendJSON(conn, peer, common.Message{"type": "close", "session": sessionID, "token": token, "reason": "stdin_eof"})
-				close(done)
+				closeDone()
 				return
 			}
 		}
@@ -125,7 +128,7 @@ func main() {
 			case <-ticker.C:
 				if time.Since(lastSeen) > common.SessionTimeout {
 					fmt.Fprintln(os.Stderr, "session timeout")
-					close(done)
+					closeDone()
 					return
 				}
 				_ = common.SendJSON(conn, peer, common.Message{"type": "keepalive", "session": sessionID, "token": token})
@@ -160,7 +163,7 @@ func main() {
 		lastSeen = time.Now()
 		switch common.String(msg, "type") {
 		case "punch":
-			_ = common.SendJSON(conn, peer, common.Message{"type": "hello", "session": sessionID, "token": token, "role": "client"})
+			_ = common.SendJSON(conn, peer, helloMessage(sessionID, token))
 		case "hello", "hello_ack":
 			active = true
 			_ = common.SendJSON(conn, peer, common.Message{"type": "hello_ack", "session": sessionID, "token": token})
@@ -169,42 +172,24 @@ func main() {
 		case "keepalive":
 			_ = common.SendJSON(conn, peer, common.Message{"type": "keepalive", "session": sessionID, "token": token})
 		case "close":
+			closeDone()
 			return
-		}
-
-		select {
-		case <-done:
-			return
-		default:
 		}
 	}
 }
 
-func setRawMode() (func(), error) {
-	original, err := exec.Command("stty", "-g").Output()
-	if err != nil {
-		return nil, err
+func helloMessage(sessionID, token string) common.Message {
+	msg := common.Message{"type": "hello", "session": sessionID, "token": token, "role": "client"}
+	for key, value := range common.TerminalInfo() {
+		msg[key] = value
 	}
-	cmd := exec.Command("stty", "raw", "-echo")
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		return nil, err
-	}
-	return func() {
-		restore := exec.Command("stty", string(original))
-		restore.Stdin = os.Stdin
-		_ = restore.Run()
-	}, nil
+	return msg
 }
 
 func sendResize(conn *net.UDPConn, peer *net.UDPAddr, sessionID, token string) {
-	out, err := exec.Command("stty", "size").Output()
+	size, err := common.GetTerminalSize()
 	if err != nil {
 		return
 	}
-	var rows, cols int
-	if _, err := fmt.Sscanf(string(out), "%d %d", &rows, &cols); err != nil {
-		return
-	}
-	_ = common.SendJSON(conn, peer, common.Message{"type": "resize", "session": sessionID, "token": token, "rows": rows, "cols": cols})
+	_ = common.SendJSON(conn, peer, common.Message{"type": "resize", "session": sessionID, "token": token, "rows": size[1], "cols": size[0]})
 }

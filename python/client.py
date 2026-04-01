@@ -4,23 +4,13 @@ import os
 import select
 import signal
 import socket
-import subprocess
 import sys
 import termios
 import threading
 import time
 import tty
 
-from common import KEEPALIVE_EVERY, MAX_PACKET_SIZE, PUNCH_EVERY, PUNCH_TIMEOUT, SESSION_TIMEOUT, decode_data, encode_data, parse_host_port, recv_json, send_json
-
-
-def get_tty_size():
-    try:
-        out = subprocess.check_output(["stty", "size"], stdin=sys.stdin)
-        rows, cols = out.decode().strip().split()
-        return int(rows), int(cols)
-    except Exception:
-        return None, None
+from common import KEEPALIVE_EVERY, MAX_PACKET_SIZE, PUNCH_EVERY, PUNCH_TIMEOUT, SESSION_TIMEOUT, decode_data, encode_data, parse_host_port, recv_json, send_json, terminal_info
 
 
 def main():
@@ -53,6 +43,17 @@ def main():
         if old_attrs is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
 
+    def hello_message():
+        payload = {"type": "hello", "session": session_id, "token": token, "role": "client"}
+        payload.update(terminal_info())
+        return payload
+
+    def send_resize():
+        if peer and session_id and token:
+            payload = {"type": "resize", "session": session_id, "token": token}
+            payload.update(terminal_info())
+            send_json(sock, peer, payload)
+
     def close(reason="close"):
         nonlocal closed
         if closed:
@@ -66,11 +67,18 @@ def main():
         restore()
         raise SystemExit(0)
 
-    def stop(_sig, _frame):
+    def stop(sig, _frame):
+        if sig == signal.SIGWINCH:
+            try:
+                send_resize()
+            except OSError:
+                pass
+            return
         close("signal")
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGWINCH, stop)
 
     while peer is None:
         data, _ = sock.recvfrom(MAX_PACKET_SIZE)
@@ -84,15 +92,13 @@ def main():
 
     if old_attrs is not None:
         tty.setraw(sys.stdin.fileno())
-    rows, cols = get_tty_size()
-    if rows and cols:
-        send_json(sock, peer, {"type": "resize", "session": session_id, "token": token, "rows": rows, "cols": cols})
+    send_resize()
 
     def punch_loop():
         deadline = time.time() + PUNCH_TIMEOUT
         while time.time() < deadline and not closed and not active:
             send_json(sock, peer, {"type": "punch", "session": session_id, "token": token})
-            send_json(sock, peer, {"type": "hello", "session": session_id, "token": token, "role": "client"})
+            send_json(sock, peer, hello_message())
             time.sleep(PUNCH_EVERY)
 
     def keepalive_loop():
@@ -109,7 +115,10 @@ def main():
     threading.Thread(target=keepalive_loop, daemon=True).start()
 
     while True:
-        readable, _, _ = select.select([sock, sys.stdin], [], [], 0.1)
+        watch = [sock]
+        if not closed:
+            watch.append(sys.stdin)
+        readable, _, _ = select.select(watch, [], [], 0.1)
         if sys.stdin in readable:
             chunk = os.read(sys.stdin.fileno(), 4096)
             if not chunk:
@@ -123,7 +132,7 @@ def main():
             last_seen = time.time()
             msg_type = msg.get("type")
             if msg_type == "punch":
-                send_json(sock, peer, {"type": "hello", "session": session_id, "token": token, "role": "client"})
+                send_json(sock, peer, hello_message())
             elif msg_type in ("hello", "hello_ack"):
                 active = True
                 send_json(sock, peer, {"type": "hello_ack", "session": session_id, "token": token})
