@@ -1,0 +1,9 @@
+{
+  "name": "rshell-bun",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "host": "bun run host.js",
+    "client": "bun run client.js"
+  }
+}
