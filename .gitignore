@@ -3,6 +3,7 @@ node_modules/
 vendor/
 dist/
 build/
+.tmpbin/
 *.log
 *.pyc
 __pycache__/
