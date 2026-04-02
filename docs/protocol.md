@@ -58,6 +58,8 @@ Sent by client to rendezvous.
 
 Sent by rendezvous to both peers.
 
+Rendezvous may retransmit the same `connect_intro` several times to reduce startup stalls from UDP loss. Clients may also retransmit `connect_request` while waiting for intro.
+
 ```json
 {
   "v": 1,
@@ -136,33 +138,45 @@ Confirms the peer session is active.
 }
 ```
 
-### `stdin`
+### `data`
 
-Client to host shell input.
+Reliable ordered stream payload.
 
-```json
-{
-  "v": 1,
-  "type": "stdin",
-  "session": "sess-...",
-  "token": "randhex",
-  "data": "base64-bytes"
-}
-```
-
-### `stdout`
-
-Host to client shell output.
+Implementations should chunk interactive byte streams conservatively so the resulting base64 JSON datagrams stay well below practical UDP fragmentation limits.
 
 ```json
 {
   "v": 1,
-  "type": "stdout",
+  "type": "data",
   "session": "sess-...",
   "token": "randhex",
+  "stream": "stdin",
+  "seq": 42,
   "data": "base64-bytes"
 }
 ```
+
+- `stream: "stdin"` is client to host shell input.
+- `stream: "pty"` is host to client PTY output.
+
+Because the remote shell runs under a PTY, PTY output carries the combined interactive `stdout` and `stderr` stream. There is no separate reliable `stderr` stream in PTY mode.
+
+### `ack`
+
+Reliable cumulative acknowledgement for a specific data stream.
+
+```json
+{
+  "v": 1,
+  "type": "ack",
+  "session": "sess-...",
+  "token": "randhex",
+  "stream": "pty",
+  "ack": 42
+}
+```
+
+Receivers buffer out-of-order `data` packets, deliver only contiguous chunks in order, and acknowledge the highest contiguous sequence they have accepted.
 
 ### `resize`
 
@@ -179,7 +193,7 @@ Client to host terminal resize hint.
 }
 ```
 
-Go and Python hosts apply resize directly to the PTY. Bun and PHP hosts apply resize through a shell-side `stty` update.
+All current hosts apply resize directly to a native PTY backend.
 
 ### `keepalive`
 
@@ -213,7 +227,7 @@ Bidirectional session shutdown.
 - Host registration refresh: every 10 seconds
 - Host registration expiry: 30 seconds
 - Punch/hello retry interval: 500 milliseconds
-- Punch/hello phase timeout: 15 seconds
+- Punch/hello phase timeout: 20 seconds
 - Keepalive interval: 5 seconds
 - Session idle timeout: 20 seconds
 
@@ -222,6 +236,10 @@ Bidirectional session shutdown.
 - Unknown fields must be ignored.
 - Unknown message types should be dropped.
 - `data` payloads are base64 encoded raw bytes.
+- `data.stream` and `ack.stream` are case-sensitive stream names.
+- `data.seq` must increase monotonically per stream.
+- Receivers should buffer out-of-order `data` packets and deliver them only after missing lower sequence numbers arrive.
+- `ack.ack` is cumulative: it acknowledges receipt of all contiguous packets for that stream up to and including that sequence number.
 - JSON object keys are case-sensitive.
 - All implementations must validate `v`, `session`, and `token` before processing session messages.
 - Clients should include terminal metadata in `hello` and `resize`.

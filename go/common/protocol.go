@@ -3,7 +3,6 @@ package common
 import (
 	"encoding/base64"
 	"encoding/json"
-	"log"
 	"net"
 	"os"
 	"time"
@@ -12,10 +11,12 @@ import (
 const (
 	Version          = 1
 	MaxPacketSize    = 64 * 1024
+	MaxDataChunk     = 1024
+	IntroEvery       = 1 * time.Second
 	KeepaliveEvery   = 5 * time.Second
 	SessionTimeout   = 20 * time.Second
 	PunchEvery       = 500 * time.Millisecond
-	PunchTimeout     = 15 * time.Second
+	PunchTimeout     = 20 * time.Second
 	RegisterEvery    = 10 * time.Second
 	RegisterDeadline = 30 * time.Second
 )
@@ -37,6 +38,10 @@ func DecodeJSON(buf []byte) (Message, error) {
 	var msg Message
 	err := json.Unmarshal(buf, &msg)
 	return msg, err
+}
+
+func ValidVersion(msg Message) bool {
+	return Int(msg, "v") == Version
 }
 
 func String(msg Message, key string) string {
@@ -67,13 +72,8 @@ func EncodeData(data []byte) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
-func DecodeData(s string) []byte {
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		log.Printf("base64 decode error: %v", err)
-		return nil
-	}
-	return b
+func DecodeData(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
 }
 
 func TerminalInfo() Message {
@@ -83,8 +83,8 @@ func TerminalInfo() Message {
 	}
 	return Message{
 		"term":         envOrDefault("TERM", "xterm-256color"),
-		"term_program": envOrDefault("TERM_PROGRAM", "rshell"),
-		"terminal":     envOrDefault("TERMINAL", "rshell"),
+		"term_program": envOrDefault("TERM_PROGRAM", "rshell-go-client"),
+		"terminal":     envOrDefault("TERMINAL", "rshell-go-client"),
 		"cols":         cols,
 		"rows":         rows,
 	}

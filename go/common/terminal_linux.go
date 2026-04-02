@@ -6,15 +6,17 @@ import (
 	"golang.org/x/term"
 )
 
+type TerminalState = term.State
+
 func IsTerminal() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) || term.IsTerminal(int(os.Stdout.Fd()))
 }
 
-func MakeRaw() (*term.State, error) {
+func MakeRaw() (*TerminalState, error) {
 	return term.MakeRaw(int(os.Stdin.Fd()))
 }
 
-func RestoreTerminal(state *term.State) error {
+func RestoreTerminal(state *TerminalState) error {
 	if state == nil {
 		return nil
 	}

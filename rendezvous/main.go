@@ -5,10 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
-	"log"
 	"net"
 	"sync"
 	"time"
+
+	"rshell/go/common"
 )
 
 const (
@@ -47,17 +48,20 @@ type serverState struct {
 }
 
 func main() {
+	logger := common.NewLogger("go", "rendezvous")
 	listen := flag.String("listen", ":4000", "UDP listen address")
 	flag.Parse()
 
 	addr, err := net.ResolveUDPAddr("udp", *listen)
 	if err != nil {
-		log.Fatalf("resolve listen addr: %v", err)
+		logger.Error("startup_failed", "failed to resolve listen address", "listen", *listen, "error", err.Error())
+		return
 	}
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("listen udp: %v", err)
+		logger.Error("startup_failed", "failed to listen on udp socket", "listen", *listen, "error", err.Error())
+		return
 	}
 	defer conn.Close()
 
@@ -68,22 +72,22 @@ func main() {
 
 	go state.gcLoop()
 
-	log.Printf("rendezvous listening on %s", conn.LocalAddr())
+	logger.Info("listening", "rendezvous server is listening", "listen", conn.LocalAddr().String())
 	buf := make([]byte, maxPacketSize)
 	for {
 		n, peer, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("read error: %v", err)
+			logger.Error("read_failed", "failed to read udp packet", "error", err.Error())
 			continue
 		}
 
 		var msg message
 		if err := json.Unmarshal(buf[:n], &msg); err != nil {
-			log.Printf("invalid json from %s: %v", peer, err)
+			logger.Error("invalid_packet", "failed to decode udp packet", "peer", peer.String(), "error", err.Error())
 			continue
 		}
 
-		state.handle(conn, peer, msg)
+		state.handle(conn, cloneAddr(peer), msg)
 	}
 }
 
@@ -125,7 +129,7 @@ func (s *serverState) handleRegister(conn *net.UDPConn, peer *net.UDPAddr, msg m
 		"public_addr":   peer.String(),
 		"expires_in_ms": registrationTTL.Milliseconds(),
 	})
-	log.Printf("registered service=%s addr=%s", service, peer)
+	common.NewLogger("go", "rendezvous").Info("registered", "registration confirmed", "service", service, "public_addr", peer.String())
 }
 
 func (s *serverState) handleConnect(conn *net.UDPConn, peer *net.UDPAddr, msg message) {
@@ -168,7 +172,7 @@ func (s *serverState) handleConnect(conn *net.UDPConn, peer *net.UDPAddr, msg me
 		"token":      sess.token,
 		"peer_addr":  sess.clientAddr.String(),
 		"peer_meta":  sess.clientMeta,
-		"timeout_ms": 15000,
+		"timeout_ms": 20000,
 	}
 	clientIntro := message{
 		"v":          protocolVersion,
@@ -179,12 +183,17 @@ func (s *serverState) handleConnect(conn *net.UDPConn, peer *net.UDPAddr, msg me
 		"token":      sess.token,
 		"peer_addr":  sess.hostAddr.String(),
 		"peer_meta":  sess.hostMeta,
-		"timeout_ms": 15000,
+		"timeout_ms": 20000,
 	}
 
-	sendJSON(conn, sess.hostAddr, hostIntro)
-	sendJSON(conn, sess.clientAddr, clientIntro)
-	log.Printf("introduced service=%s session=%s host=%s client=%s", service, sess.id, sess.hostAddr, sess.clientAddr)
+	for i := 0; i < 3; i++ {
+		sendJSON(conn, sess.hostAddr, hostIntro)
+		sendJSON(conn, sess.clientAddr, clientIntro)
+		if i < 2 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	common.NewLogger("go", "rendezvous").Info("session_intro", "introduced host and client peers", "service", service, "session", sess.id, "host", sess.hostAddr.String(), "client", sess.clientAddr.String())
 }
 
 func (s *serverState) handleKeepalive(conn *net.UDPConn, peer *net.UDPAddr, msg message) {
@@ -227,11 +236,11 @@ func sendJSON(conn *net.UDPConn, addr *net.UDPAddr, msg message) {
 	msg["ts"] = time.Now().UnixMilli()
 	buf, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("marshal error: %v", err)
+		common.NewLogger("go", "rendezvous").Error("encode_failed", "failed to encode udp packet", "error", err.Error())
 		return
 	}
 	if _, err := conn.WriteToUDP(buf, addr); err != nil {
-		log.Printf("write error to %s: %v", addr, err)
+		common.NewLogger("go", "rendezvous").Error("write_failed", "failed to write udp packet", "peer", addr.String(), "error", err.Error())
 	}
 }
 

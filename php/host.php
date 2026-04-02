@@ -27,9 +27,11 @@ function close_session(&$sessions, $socket, string $id, string $reason = 'close'
     @send_json($socket, $sessions[$id]['peer'], ['type' => 'close', 'session' => $id, 'token' => $sessions[$id]['token'], 'reason' => $reason]);
     if (!empty($sessions[$id]['master_stream'])) {
         @fclose($sessions[$id]['master_stream']);
-    }
-    if (isset($sessions[$id]['master_fd'])) {
+        $sessions[$id]['master_stream'] = null;
+        $sessions[$id]['master_fd'] = null;
+    } elseif (isset($sessions[$id]['master_fd'])) {
         native_close_fd((int) $sessions[$id]['master_fd']);
+        $sessions[$id]['master_fd'] = null;
     }
     if (!empty($sessions[$id]['child_pid'])) {
         native_kill_pid((int) $sessions[$id]['child_pid']);
@@ -38,8 +40,8 @@ function close_session(&$sessions, $socket, string $id, string $reason = 'close'
 
 function capture_terminal(&$session, array $msg): void {
     if (!empty($msg['term'])) $session['term'] = $msg['term'];
-    if (!empty($msg['cols'])) $session['cols'] = (int) $msg['cols'];
-    if (!empty($msg['rows'])) $session['rows'] = (int) $msg['rows'];
+    $session['cols'] = positive_int($msg['cols'] ?? null, (int) ($session['cols'] ?? 80));
+    $session['rows'] = positive_int($msg['rows'] ?? null, (int) ($session['rows'] ?? 24));
 }
 
 function apply_resize(&$sessions, string $id): void {
@@ -49,19 +51,21 @@ function apply_resize(&$sessions, string $id): void {
     native_set_winsize((int) $sessions[$id]['master_fd'], (int) ($sessions[$id]['cols'] ?? 80), (int) ($sessions[$id]['rows'] ?? 24));
 }
 
-function start_shell(&$sessions, $socket, string $id, string $shell): void {
+function start_shell(&$sessions, $socket, string $id, string $shell): bool {
     if (!isset($sessions[$id]) || $sessions[$id]['active'] || $sessions[$id]['closed']) {
-        return;
+        return true;
     }
     $pty = native_openpty((int) ($sessions[$id]['cols'] ?? 80), (int) ($sessions[$id]['rows'] ?? 24));
     if ($pty === null) {
-        return;
+        close_session($sessions, $socket, $id, 'shell_start_failed');
+        return false;
     }
     $pid = pcntl_fork();
     if ($pid === -1) {
         native_close_fd($pty['master_fd']);
         native_close_fd($pty['slave_fd']);
-        return;
+        close_session($sessions, $socket, $id, 'shell_start_failed');
+        return false;
     }
     if ($pid === 0) {
         native_close_fd($pty['master_fd']);
@@ -80,7 +84,8 @@ function start_shell(&$sessions, $socket, string $id, string $shell): void {
     if ($masterStream === false) {
         native_kill_pid($pid);
         native_close_fd($pty['master_fd']);
-        return;
+        close_session($sessions, $socket, $id, 'shell_start_failed');
+        return false;
     }
     stream_set_blocking($masterStream, false);
 
@@ -88,6 +93,7 @@ function start_shell(&$sessions, $socket, string $id, string $shell): void {
     $sessions[$id]['master_fd'] = $pty['master_fd'];
     $sessions[$id]['master_stream'] = $masterStream;
     $sessions[$id]['active'] = true;
+    return true;
 }
 
 function send_register($socket, string $service, array $rdv): void {
@@ -99,6 +105,16 @@ pcntl_signal(SIGINT, function() use (&$running) { $running = false; });
 pcntl_signal(SIGTERM, function() use (&$running) { $running = false; });
 
 while ($running) {
+    $read = [$socket];
+    foreach ($sessions as $session) {
+        if (!empty($session['master_stream'])) {
+            $read[] = $session['master_stream'];
+        }
+    }
+    $write = null;
+    $except = null;
+    @stream_select($read, $write, $except, 0, 500000);
+
     $now = microtime(true);
     if ($now - $lastRegister >= REGISTER_EVERY) {
         send_register($socket, $service, [$rdvHost, $rdvPort]);
@@ -126,10 +142,10 @@ while ($running) {
         } catch (Throwable $e) {
             $msg = null;
         }
-        if ($msg) {
+        if ($msg && message_has_version($msg)) {
             $type = $msg['type'] ?? '';
             if ($type === 'register_ok') {
-                fwrite(STDERR, "registered {$service} public=" . ($msg['public_addr'] ?? '') . PHP_EOL);
+                log_event('info', 'php', 'host', 'registered', 'registration confirmed', ['service' => $service, 'public_addr' => $msg['public_addr'] ?? '']);
             } elseif ($type === 'connect_intro') {
                 $sessions[$msg['session']] = [
                     'token' => $msg['token'],
@@ -138,10 +154,14 @@ while ($running) {
                     'closed' => false,
                     'last_seen' => $now,
                     'punch_until' => $now + PUNCH_TIMEOUT,
+                    'last_punch' => 0.0,
                     'term' => 'xterm-256color',
                     'cols' => 80,
                     'rows' => 24,
+                    'stdin_rx' => reliable_receiver_create(),
+                    'pty_tx' => reliable_sender_create('pty'),
                 ];
+                log_event('info', 'php', 'host', 'session_intro', 'received session intro', ['service' => $service, 'session' => $msg['session'], 'peer' => $msg['peer_addr']]);
             } elseif (!empty($msg['session']) && isset($sessions[$msg['session']]) && $sessions[$msg['session']]['token'] === ($msg['token'] ?? '')) {
                 $id = $msg['session'];
                 $sessions[$id]['last_seen'] = $now;
@@ -149,16 +169,34 @@ while ($running) {
                     @send_json($socket, $sessions[$id]['peer'], ['type' => 'hello', 'session' => $id, 'token' => $sessions[$id]['token'], 'role' => 'host']);
                 } elseif ($type === 'hello') {
                     capture_terminal($sessions[$id], $msg);
-                    start_shell($sessions, $socket, $id, $shell);
+                    if (!start_shell($sessions, $socket, $id, $shell)) {
+                        unset($sessions[$id]);
+                        continue;
+                    }
                     @send_json($socket, $sessions[$id]['peer'], ['type' => 'hello_ack', 'session' => $id, 'token' => $sessions[$id]['token']]);
                 } elseif ($type === 'hello_ack') {
-                    start_shell($sessions, $socket, $id, $shell);
-                } elseif ($type === 'stdin') {
-                    start_shell($sessions, $socket, $id, $shell);
-                    if (!empty($sessions[$id]['master_stream'])) {
-                        @fwrite($sessions[$id]['master_stream'], decode_data($msg['data'] ?? ''));
-                        @fflush($sessions[$id]['master_stream']);
+                    if (!start_shell($sessions, $socket, $id, $shell)) {
+                        unset($sessions[$id]);
                     }
+                } elseif ($type === 'data' && ($msg['stream'] ?? '') === 'stdin') {
+                    if (!start_shell($sessions, $socket, $id, $shell)) {
+                        unset($sessions[$id]);
+                        continue;
+                    }
+                    if (!empty($sessions[$id]['master_stream'])) {
+                        try {
+                            [$chunks, $ack] = reliable_receiver_accept($sessions[$id]['stdin_rx'], positive_int($msg['seq'] ?? null, 0), decode_data($msg['data'] ?? ''));
+                            foreach ($chunks as $chunk) {
+                                @fwrite($sessions[$id]['master_stream'], $chunk);
+                                @fflush($sessions[$id]['master_stream']);
+                            }
+                            @send_json($socket, $sessions[$id]['peer'], ['type' => 'ack', 'session' => $id, 'token' => $sessions[$id]['token'], 'stream' => 'stdin', 'ack' => $ack]);
+                        } catch (Throwable $e) {
+                            log_event('error', 'php', 'host', 'invalid_payload', 'dropped invalid stdin payload', ['session' => $id]);
+                        }
+                    }
+                } elseif ($type === 'ack' && ($msg['stream'] ?? '') === 'pty') {
+                    reliable_sender_ack($sessions[$id]['pty_tx'], positive_int($msg['ack'] ?? null, 0));
                 } elseif ($type === 'resize') {
                     capture_terminal($sessions[$id], $msg);
                     apply_resize($sessions, $id);
@@ -173,14 +211,18 @@ while ($running) {
     }
 
     foreach (array_keys($sessions) as $id) {
-        if (!$sessions[$id]['closed'] && !$sessions[$id]['active'] && $now < $sessions[$id]['punch_until']) {
+        if (!$sessions[$id]['closed'] && !$sessions[$id]['active'] && $now < $sessions[$id]['punch_until'] && $now - ($sessions[$id]['last_punch'] ?? 0.0) >= PUNCH_EVERY) {
             @send_json($socket, $sessions[$id]['peer'], ['type' => 'punch', 'session' => $id, 'token' => $sessions[$id]['token']]);
             @send_json($socket, $sessions[$id]['peer'], ['type' => 'hello', 'session' => $id, 'token' => $sessions[$id]['token'], 'role' => 'host']);
+            $sessions[$id]['last_punch'] = $now;
         }
-        if (!empty($sessions[$id]['master_stream'])) {
-            $chunk = @fread($sessions[$id]['master_stream'], 4096);
+        foreach (reliable_sender_retransmit($sessions[$id]['pty_tx'], $id, $sessions[$id]['token']) as $msg) {
+            @send_json($socket, $sessions[$id]['peer'], $msg);
+        }
+        if (!empty($sessions[$id]['master_stream']) && in_array($sessions[$id]['master_stream'], $read, true)) {
+            $chunk = @fread($sessions[$id]['master_stream'], CHUNK_SIZE);
             if ($chunk !== false && $chunk !== '') {
-                @send_json($socket, $sessions[$id]['peer'], ['type' => 'stdout', 'session' => $id, 'token' => $sessions[$id]['token'], 'data' => encode_data($chunk)]);
+                @send_json($socket, $sessions[$id]['peer'], reliable_sender_push($sessions[$id]['pty_tx'], $id, $sessions[$id]['token'], $chunk));
             }
         }
         if (!empty($sessions[$id]['child_pid']) && native_waitpid((int) $sessions[$id]['child_pid'])) {
@@ -188,8 +230,6 @@ while ($running) {
             unset($sessions[$id]);
         }
     }
-
-    usleep(20000);
 }
 
 foreach (array_keys($sessions) as $id) {

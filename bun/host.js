@@ -1,6 +1,11 @@
 import process from "node:process";
-import { spawn as spawnPty } from "bun-pty";
-import { createSocket, decodeData, decodeJson, parseHostPort, PUNCH_EVERY_MS, PUNCH_TIMEOUT_MS, REGISTER_EVERY_MS, KEEPALIVE_EVERY_MS, SESSION_TIMEOUT_MS, sendJson, encodeData } from "./common.js";
+import { createSocket, decodeData, decodeJson, hasVersion, logEvent, MAX_DATA_CHUNK, parseHostPort, PUNCH_EVERY_MS, PUNCH_TIMEOUT_MS, REGISTER_EVERY_MS, KEEPALIVE_EVERY_MS, RETRANSMIT_EVERY_MS, SESSION_TIMEOUT_MS, sendJson, positiveInt, ReliableReceiver, ReliableSender } from "./common.js";
+
+let spawnPty = null;
+try {
+  ({ spawn: spawnPty } = await import("bun-pty"));
+} catch {
+}
 
 process.title = "rshell-bun-host";
 
@@ -40,29 +45,42 @@ function closeSession(session, reason = "close") {
   }
 }
 
+function sendStdout(session, chunk) {
+  for (let offset = 0; offset < chunk.length; offset += MAX_DATA_CHUNK) {
+    sendJson(socket, session.peer.port, session.peer.host, session.ptySender.push(session.id, session.token, chunk.subarray(offset, offset + MAX_DATA_CHUNK))).catch(() => {});
+  }
+}
+
 function startShell(session) {
   if (session.active || session.closed) {
     return;
   }
-  const pty = spawnPty(shell, ["-i"], {
-    name: session.term || "xterm-256color",
-    cols: session.cols || 80,
-    rows: session.rows || 24,
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      TERM: session.term || "xterm-256color",
-      TERM_PROGRAM: "rshell-bun-host",
-      TERMINAL: "rshell-bun-host"
-    }
-  });
+  if (!spawnPty) {
+    closeSession(session, "shell_start_failed");
+    sessions.delete(session.id);
+    return;
+  }
+  let pty;
+  try {
+    pty = spawnPty(shell, ["-i"], {
+      name: session.term || "xterm-256color",
+      cols: session.cols || 80,
+      rows: session.rows || 24,
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        TERM: session.term || "xterm-256color",
+        TERM_PROGRAM: "rshell-bun-host",
+        TERMINAL: "rshell-bun-host"
+      }
+    });
+  } catch {
+    closeSession(session, "shell_start_failed");
+    sessions.delete(session.id);
+    return;
+  }
   session.outputSub = pty.onData((data) => {
-    sendJson(socket, session.peer.port, session.peer.host, {
-      type: "stdout",
-      session: session.id,
-      token: session.token,
-      data: encodeData(Buffer.from(data, "utf8"))
-    }).catch(() => {});
+    sendStdout(session, Buffer.from(data, "latin1"));
   });
   session.exitSub = pty.onExit(() => {
     closeSession(session, "shell_exit");
@@ -84,12 +102,12 @@ function applyResize(session) {
 
 function captureTerminal(session, msg) {
   if (msg.term) session.term = msg.term;
-  if (msg.cols) session.cols = msg.cols;
-  if (msg.rows) session.rows = msg.rows;
+  session.cols = positiveInt(msg.cols, session.cols);
+  session.rows = positiveInt(msg.rows, session.rows);
 }
 
 await register();
-setInterval(() => register().catch((err) => console.error("register error", err.message)), REGISTER_EVERY_MS);
+setInterval(() => register().catch((err) => logEvent("error", "bun", "host", "register_failed", "failed to refresh registration", { service, error: err.message })), REGISTER_EVERY_MS);
 setInterval(() => {
   const now = Date.now();
   sendJson(socket, rendezvous.port, rendezvous.host, { type: "keepalive", service }).catch(() => {});
@@ -105,6 +123,17 @@ setInterval(() => {
   }
 }, KEEPALIVE_EVERY_MS);
 
+setInterval(() => {
+  for (const session of sessions.values()) {
+    if (session.closed || !session.ptySender) {
+      continue;
+    }
+    for (const msg of session.ptySender.retransmit(session.id, session.token)) {
+      sendJson(socket, session.peer.port, session.peer.host, msg).catch(() => {});
+    }
+  }
+}, RETRANSMIT_EVERY_MS);
+
 socket.on("message", async (data) => {
   let msg;
   try {
@@ -112,9 +141,12 @@ socket.on("message", async (data) => {
   } catch {
     return;
   }
+  if (!hasVersion(msg)) {
+    return;
+  }
   switch (msg.type) {
     case "register_ok":
-      console.error(`registered ${service} public=${msg.public_addr}`);
+      logEvent("info", "bun", "host", "registered", "registration confirmed", { service, public_addr: msg.public_addr });
       return;
     case "connect_intro": {
       const peer = parseHostPort(msg.peer_addr);
@@ -128,6 +160,8 @@ socket.on("message", async (data) => {
         term: "xterm-256color",
         cols: 80,
         rows: 24,
+        stdinReceiver: new ReliableReceiver(),
+        ptySender: new ReliableSender("pty"),
         pty: null,
         outputSub: null,
         exitSub: null
@@ -141,6 +175,7 @@ socket.on("message", async (data) => {
         sendJson(socket, peer.port, peer.host, { type: "hello", session: session.id, token: session.token, role: "host" }).catch(() => {});
       }, PUNCH_EVERY_MS);
       sessions.set(session.id, session);
+      logEvent("info", "bun", "host", "session_intro", "received session intro", { service, session: session.id, peer: `${peer.host}:${peer.port}` });
       return;
     }
   }
@@ -161,11 +196,24 @@ socket.on("message", async (data) => {
     case "hello_ack":
       startShell(session);
       break;
-    case "stdin":
+    case "data":
+      if (msg.stream !== "stdin") {
+        break;
+      }
       startShell(session);
       try {
-        session.pty?.write?.(decodeData(msg.data).toString("utf8"));
+        const { chunks, ack } = session.stdinReceiver.accept(Number(msg.seq || 0), decodeData(msg.data));
+        for (const chunk of chunks) {
+          session.pty?.write?.(chunk.toString("latin1"));
+        }
+        await sendJson(socket, session.peer.port, session.peer.host, { type: "ack", session: session.id, token: session.token, stream: "stdin", ack }).catch(() => {});
       } catch {
+        logEvent("error", "bun", "host", "invalid_payload", "dropped invalid stdin payload", { session: session.id });
+      }
+      break;
+    case "ack":
+      if (msg.stream === "pty") {
+        session.ptySender.ack(Number(msg.ack || 0));
       }
       break;
     case "keepalive":

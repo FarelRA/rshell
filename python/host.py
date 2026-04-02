@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import ctypes
-import json
 import os
 import pty
+import select
 import signal
 import socket
 import sys
 import threading
 import time
 
-from common import KEEPALIVE_EVERY, MAX_PACKET_SIZE, PUNCH_EVERY, PUNCH_TIMEOUT, REGISTER_EVERY, SESSION_TIMEOUT, decode_data, parse_host_port, recv_json, send_json, encode_data, set_winsize
+from common import CHUNK_SIZE, KEEPALIVE_EVERY, MAX_PACKET_SIZE, PUNCH_EVERY, PUNCH_TIMEOUT, REGISTER_EVERY, ReliableReceiver, ReliableSender, SESSION_TIMEOUT, decode_data, encode_data, has_version, log_event, parse_host_port, positive_int, recv_json, send_json, set_winsize
 
 
 class Session:
@@ -26,6 +26,8 @@ class Session:
         self.term = "xterm-256color"
         self.cols = 80
         self.rows = 24
+        self.stdin_rx = ReliableReceiver()
+        self.pty_tx = ReliableSender("pty")
 
 
 def main():
@@ -53,10 +55,14 @@ def main():
     def register():
         send_json(sock, rdv, {"type": "register", "service": args.service, "meta": {"impl": "python-host"}})
 
+    def remove_session(session_id):
+        with lock:
+            sessions.pop(session_id, None)
+
     def capture_terminal(sess, msg):
         sess.term = msg.get("term") or sess.term
-        sess.cols = int(msg.get("cols") or sess.cols)
-        sess.rows = int(msg.get("rows") or sess.rows)
+        sess.cols = positive_int(msg.get("cols"), sess.cols)
+        sess.rows = positive_int(msg.get("rows"), sess.rows)
 
     def close_session(sess, reason="close"):
         if sess.closed:
@@ -71,16 +77,24 @@ def main():
                 os.close(sess.pty_fd)
             except OSError:
                 pass
+            sess.pty_fd = None
         if sess.child_pid:
             try:
                 os.kill(sess.child_pid, signal.SIGKILL)
             except OSError:
                 pass
+            sess.child_pid = None
+        sess.active = False
 
     def start_shell(sess):
         if sess.active or sess.closed:
             return
-        pid, fd = pty.fork()
+        try:
+            pid, fd = pty.fork()
+        except OSError:
+            log_event("error", "python", "host", "shell_start_failed", "failed to start shell", session=sess.id)
+            close_session(sess, "shell_start_failed")
+            return
         if pid == 0:
             os.environ["TERM"] = sess.term
             os.environ["TERM_PROGRAM"] = "rshell-python-host"
@@ -97,19 +111,31 @@ def main():
         def pump_stdout():
             while not sess.closed:
                 try:
-                    chunk = os.read(fd, 4096)
+                    chunk = os.read(fd, CHUNK_SIZE)
                 except OSError:
                     break
                 if chunk:
                     try:
-                        send_json(sock, sess.peer, {"type": "stdout", "session": sess.id, "token": sess.token, "data": encode_data(chunk)})
+                        send_json(sock, sess.peer, sess.pty_tx.push(sess.id, sess.token, chunk))
                     except OSError:
                         pass
                     continue
                 break
             close_session(sess, "shell_exit")
+            remove_session(sess.id)
 
         threading.Thread(target=pump_stdout, daemon=True).start()
+
+        def reap_child():
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            sess.child_pid = None
+            close_session(sess, "shell_exit")
+            remove_session(sess.id)
+
+        threading.Thread(target=reap_child, daemon=True).start()
 
     def punch_loop(sess):
         deadline = time.time() + PUNCH_TIMEOUT
@@ -137,6 +163,8 @@ def main():
                     if sess.active:
                         try:
                             send_json(sock, sess.peer, {"type": "keepalive", "session": sess.id, "token": sess.token})
+                            for msg in sess.pty_tx.retransmit(sess.id, sess.token):
+                                send_json(sock, sess.peer, msg)
                         except OSError:
                             pass
             time.sleep(KEEPALIVE_EVERY)
@@ -165,26 +193,28 @@ def main():
     signal.signal(signal.SIGTERM, stop)
 
     while True:
-        try:
-            data, _addr = sock.recvfrom(MAX_PACKET_SIZE)
-        except BlockingIOError:
-            time.sleep(0.02)
+        readable, _, _ = select.select([sock], [], [], 0.5)
+        if sock not in readable:
             continue
 
         try:
+            data, _addr = sock.recvfrom(MAX_PACKET_SIZE)
             msg = recv_json(data)
-        except json.JSONDecodeError:
+        except (BlockingIOError, ValueError):
+            continue
+        if not has_version(msg):
             continue
 
         msg_type = msg.get("type")
         if msg_type == "register_ok":
-            print(f"registered {args.service} public={msg.get('public_addr')}", file=sys.stderr)
+            log_event("info", "python", "host", "registered", "registration confirmed", service=args.service, public_addr=msg.get("public_addr"))
             continue
         if msg_type == "connect_intro":
             sess = Session(msg["session"], msg["token"], parse_host_port(msg["peer_addr"]))
             with lock:
                 sessions[sess.id] = sess
             threading.Thread(target=punch_loop, args=(sess,), daemon=True).start()
+            log_event("info", "python", "host", "session_intro", "received session intro", service=args.service, session=sess.id, peer=f"{sess.peer[0]}:{sess.peer[1]}")
             continue
 
         session_id = msg.get("session")
@@ -192,7 +222,7 @@ def main():
             continue
         with lock:
             sess = sessions.get(session_id)
-        if not sess or sess.token != msg.get("token"):
+        if not sess or sess.closed or sess.token != msg.get("token"):
             continue
         sess.last_seen = time.time()
 
@@ -204,13 +234,25 @@ def main():
             send_json(sock, sess.peer, {"type": "hello_ack", "session": sess.id, "token": sess.token})
         elif msg_type == "hello_ack":
             start_shell(sess)
-        elif msg_type == "stdin":
+        elif msg_type == "data" and msg.get("stream") == "stdin":
             start_shell(sess)
             if sess.pty_fd is not None:
-                os.write(sess.pty_fd, decode_data(msg.get("data", "")))
+                try:
+                    chunks, ack = sess.stdin_rx.accept(positive_int(msg.get("seq"), 0), decode_data(msg.get("data", "")))
+                    for delivered in chunks:
+                        os.write(sess.pty_fd, delivered)
+                    send_json(sock, sess.peer, {"type": "ack", "session": sess.id, "token": sess.token, "stream": "stdin", "ack": ack})
+                except (OSError, ValueError):
+                    log_event("error", "python", "host", "invalid_payload", "dropped invalid stdin payload", session=sess.id)
+                    continue
+        elif msg_type == "ack" and msg.get("stream") == "pty":
+            sess.pty_tx.ack(positive_int(msg.get("ack"), 0))
         elif msg_type == "resize":
             capture_terminal(sess, msg)
-            set_winsize(sess.pty_fd, sess.rows, sess.cols)
+            try:
+                set_winsize(sess.pty_fd, sess.rows, sess.cols)
+            except OSError:
+                remove_session(sess.id)
         elif msg_type == "keepalive":
             pass
         elif msg_type == "close":
