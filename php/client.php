@@ -50,6 +50,9 @@ function resize_message(?string $sessionId, ?string $token, ?int $ttyFd): array 
 
 pcntl_async_signals(true);
 pcntl_signal(SIGINT, function() use ($socket, &$peer, &$sessionId, &$token, $ttyFd, $rawState) {
+    if ($ttyFd !== null && $rawState !== null) {
+        return;
+    }
     close_client($socket, $peer, $sessionId, $token, 'signal', $ttyFd, $rawState);
 });
 pcntl_signal(SIGTERM, function() use ($socket, &$peer, &$sessionId, &$token, $ttyFd, $rawState) {
@@ -95,7 +98,7 @@ while (true) {
                 } elseif ($type === 'stdout') {
                     fwrite(STDOUT, decode_data($msg['data'] ?? ''));
                 } elseif ($type === 'keepalive') {
-                    @send_json($socket, $peer, ['type' => 'keepalive', 'session' => $sessionId, 'token' => $token]);
+                    // Receiving a keepalive is sufficient to refresh $lastSeen.
                 } elseif ($type === 'close') {
                     close_client($socket, $peer, $sessionId, $token, $msg['reason'] ?? 'peer_close', $ttyFd, $rawState);
                 }

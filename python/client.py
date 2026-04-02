@@ -34,8 +34,11 @@ def main():
     active = False
     last_seen = time.time()
     closed = False
+    close_reason = None
+    stop_event = threading.Event()
 
     old_attrs = None
+    raw_mode = False
     if sys.stdin.isatty():
         old_attrs = termios.tcgetattr(sys.stdin.fileno())
 
@@ -54,18 +57,18 @@ def main():
             payload.update(terminal_info())
             send_json(sock, peer, payload)
 
-    def close(reason="close"):
-        nonlocal closed
+    def begin_close(reason="close", notify=True):
+        nonlocal closed, close_reason
         if closed:
             return
         closed = True
-        if peer and session_id and token:
+        close_reason = reason
+        stop_event.set()
+        if notify and peer and session_id and token:
             try:
                 send_json(sock, peer, {"type": "close", "session": session_id, "token": token, "reason": reason})
             except OSError:
                 pass
-        restore()
-        raise SystemExit(0)
 
     def stop(sig, _frame):
         if sig == signal.SIGWINCH:
@@ -74,7 +77,9 @@ def main():
             except OSError:
                 pass
             return
-        close("signal")
+        if sig == signal.SIGINT and raw_mode:
+            return
+        begin_close("signal")
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
@@ -92,56 +97,64 @@ def main():
 
     if old_attrs is not None:
         tty.setraw(sys.stdin.fileno())
+        raw_mode = True
     send_resize()
 
     def punch_loop():
         deadline = time.time() + PUNCH_TIMEOUT
-        while time.time() < deadline and not closed and not active:
+        while time.time() < deadline and not stop_event.is_set() and not active:
             send_json(sock, peer, {"type": "punch", "session": session_id, "token": token})
             send_json(sock, peer, hello_message())
             time.sleep(PUNCH_EVERY)
 
     def keepalive_loop():
         nonlocal last_seen
-        while not closed:
+        while not stop_event.is_set():
             if time.time() - last_seen > SESSION_TIMEOUT:
                 print("session timeout", file=sys.stderr)
-                close("timeout")
+                begin_close("timeout")
+                return
             if peer and session_id and token:
                 send_json(sock, peer, {"type": "keepalive", "session": session_id, "token": token})
-            time.sleep(KEEPALIVE_EVERY)
+            stop_event.wait(KEEPALIVE_EVERY)
 
     threading.Thread(target=punch_loop, daemon=True).start()
     threading.Thread(target=keepalive_loop, daemon=True).start()
 
-    while True:
-        watch = [sock]
-        if not closed:
-            watch.append(sys.stdin)
-        readable, _, _ = select.select(watch, [], [], 0.1)
-        if sys.stdin in readable:
-            chunk = os.read(sys.stdin.fileno(), 4096)
-            if not chunk:
-                close("stdin_eof")
-            send_json(sock, peer, {"type": "stdin", "session": session_id, "token": token, "data": encode_data(chunk)})
-        if sock in readable:
-            data, _ = sock.recvfrom(MAX_PACKET_SIZE)
-            msg = recv_json(data)
-            if msg.get("session") != session_id or msg.get("token") != token:
-                continue
-            last_seen = time.time()
-            msg_type = msg.get("type")
-            if msg_type == "punch":
-                send_json(sock, peer, hello_message())
-            elif msg_type in ("hello", "hello_ack"):
-                active = True
-                send_json(sock, peer, {"type": "hello_ack", "session": session_id, "token": token})
-            elif msg_type == "stdout":
-                os.write(sys.stdout.fileno(), decode_data(msg.get("data", "")))
-            elif msg_type == "keepalive":
-                send_json(sock, peer, {"type": "keepalive", "session": session_id, "token": token})
-            elif msg_type == "close":
-                close(msg.get("reason", "peer_close"))
+    try:
+        while not stop_event.is_set():
+            watch = [sock]
+            if not closed:
+                watch.append(sys.stdin)
+            readable, _, _ = select.select(watch, [], [], 0.1)
+            if sys.stdin in readable:
+                chunk = os.read(sys.stdin.fileno(), 4096)
+                if not chunk:
+                    begin_close("stdin_eof")
+                    continue
+                send_json(sock, peer, {"type": "stdin", "session": session_id, "token": token, "data": encode_data(chunk)})
+            if sock in readable:
+                data, _ = sock.recvfrom(MAX_PACKET_SIZE)
+                msg = recv_json(data)
+                if msg.get("session") != session_id or msg.get("token") != token:
+                    continue
+                last_seen = time.time()
+                msg_type = msg.get("type")
+                if msg_type == "punch":
+                    send_json(sock, peer, hello_message())
+                elif msg_type in ("hello", "hello_ack"):
+                    active = True
+                    send_json(sock, peer, {"type": "hello_ack", "session": session_id, "token": token})
+                elif msg_type == "stdout":
+                    os.write(sys.stdout.fileno(), decode_data(msg.get("data", "")))
+                elif msg_type == "keepalive":
+                    pass
+                elif msg_type == "close":
+                    begin_close(msg.get("reason", "peer_close"), notify=False)
+    finally:
+        restore()
+        if close_reason == "timeout":
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

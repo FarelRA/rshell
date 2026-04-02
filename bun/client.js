@@ -100,7 +100,6 @@ socket.on("message", async (data) => {
       process.stdout.write(decodeData(msg.data));
       break;
     case "keepalive":
-      await sendJson(socket, peer.port, peer.host, { type: "keepalive", session: sessionId, token }).catch(() => {});
       break;
     case "close":
       close(msg.reason || "peer_close");

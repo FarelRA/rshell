@@ -212,7 +212,7 @@ def main():
             capture_terminal(sess, msg)
             set_winsize(sess.pty_fd, sess.rows, sess.cols)
         elif msg_type == "keepalive":
-            send_json(sock, sess.peer, {"type": "keepalive", "session": sess.id, "token": sess.token})
+            pass
         elif msg_type == "close":
             with lock:
                 close_session(sess, msg.get("reason", "peer_close"))

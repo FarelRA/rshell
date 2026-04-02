@@ -169,7 +169,6 @@ socket.on("message", async (data) => {
       }
       break;
     case "keepalive":
-      await sendJson(socket, session.peer.port, session.peer.host, { type: "keepalive", session: session.id, token: session.token }).catch(() => {});
       break;
     case "close":
       closeSession(session, msg.reason || "peer_close");

@@ -158,7 +158,7 @@ func main() {
 					_, _ = sess.stdin.Write(common.DecodeData(common.String(msg, "data")))
 				}
 			case "keepalive":
-				_ = common.SendJSON(conn, sess.peer, common.Message{"type": "keepalive", "session": sess.id, "token": sess.token})
+				// Receiving a keepalive is sufficient to refresh lastSeen.
 			case "resize":
 				captureTerminal(sess, msg)
 				resizeSession(sess)

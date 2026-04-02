@@ -163,7 +163,7 @@ while ($running) {
                     capture_terminal($sessions[$id], $msg);
                     apply_resize($sessions, $id);
                 } elseif ($type === 'keepalive') {
-                    @send_json($socket, $sessions[$id]['peer'], ['type' => 'keepalive', 'session' => $id, 'token' => $sessions[$id]['token']]);
+                    // Receiving a keepalive is sufficient to refresh last_seen.
                 } elseif ($type === 'close') {
                     close_session($sessions, $socket, $id, $msg['reason'] ?? 'peer_close');
                     unset($sessions[$id]);

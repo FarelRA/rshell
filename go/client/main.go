@@ -170,7 +170,7 @@ func main() {
 		case "stdout":
 			_, _ = os.Stdout.Write(common.DecodeData(common.String(msg, "data")))
 		case "keepalive":
-			_ = common.SendJSON(conn, peer, common.Message{"type": "keepalive", "session": sessionID, "token": token})
+			// Receiving a keepalive is sufficient to refresh lastSeen.
 		case "close":
 			closeDone()
 			return
