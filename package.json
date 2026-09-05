@@ -1,4 +1,8 @@
 {
+  "private": true,
+  "scripts": {
+    "build": "bash scripts/build_dist.sh"
+  },
   "dependencies": {
     "bun-pty": "^0.4.8"
   }

@@ -6,6 +6,20 @@
 - UDP reachability to the rendezvous server
 - `script` command available on both peer machines
 
+## Build distributable artifacts
+
+Create a `dist/` directory with bundled Bun entrypoints, Linux Go binaries for `386`, `amd64`, `arm`, and `arm64`, plus the Python/PHP runtime files:
+
+```bash
+npm run build
+```
+
+Or:
+
+```bash
+bash scripts/build_dist.sh
+```
+
 ## Shared rendezvous server
 
 ```bash
@@ -90,4 +104,4 @@ Run the local interoperability smoke test:
 bash scripts/smoke_matrix.sh
 ```
 
-This builds the Go binaries, starts a local rendezvous server per test case, runs one host/client pair for each language combination, injects a simple shell command, and verifies the expected output marker.
+This rebuilds `dist/`, selects the native Go binary for the current machine from the multi-arch output, starts a local rendezvous server per test case, runs one host/client pair for each language combination, injects a simple shell command, and verifies the expected output marker.

@@ -1,29 +1,37 @@
 #!/usr/bin/env bash
-set -u
+set -euo pipefail
 
 ROOT="$(dirname "$(dirname "$0")")"
-cd "$ROOT"
+DIST="$ROOT/dist"
 
-mkdir -p .tmpbin
-go build -o .tmpbin/rendezvous ./rendezvous
-go build -o .tmpbin/go-host ./go/host
-go build -o .tmpbin/go-client ./go/client
+bash "$ROOT/scripts/build_dist.sh"
+
+case "$(uname -m)" in
+  x86_64) GO_DIST_ARCH=amd64 ;;
+  i386|i686) GO_DIST_ARCH=386 ;;
+  armv7l|armv7|arm) GO_DIST_ARCH=arm ;;
+  aarch64|arm64) GO_DIST_ARCH=arm64 ;;
+  *)
+    printf 'unsupported host architecture for smoke: %s\n' "$(uname -m)" >&2
+    exit 1
+    ;;
+esac
 
 host_cmd() {
   case "$1" in
-    go) printf '.tmpbin/go-host --rendezvous 127.0.0.1:%s --service %s' "$2" "$3" ;;
-    bun) printf 'bun run bun/host.js --rendezvous=127.0.0.1:%s --service=%s' "$2" "$3" ;;
-    python) printf 'python3 python/host.py --rendezvous 127.0.0.1:%s --service %s' "$2" "$3" ;;
-    php) printf 'php php/host.php --rendezvous=127.0.0.1:%s --service=%s' "$2" "$3" ;;
+    go) printf '"%s/go/%s/host" --rendezvous 127.0.0.1:%s --service %s' "$DIST" "$GO_DIST_ARCH" "$2" "$3" ;;
+    bun) printf 'bun "%s/bun/host.js" --rendezvous=127.0.0.1:%s --service=%s' "$DIST" "$2" "$3" ;;
+    python) printf 'python3 "%s/python/host.py" --rendezvous 127.0.0.1:%s --service %s' "$DIST" "$2" "$3" ;;
+    php) printf 'php "%s/php/host.php" --rendezvous=127.0.0.1:%s --service=%s' "$DIST" "$2" "$3" ;;
   esac
 }
 
 client_cmd() {
   case "$1" in
-    go) printf '.tmpbin/go-client --rendezvous 127.0.0.1:%s --service %s' "$2" "$3" ;;
-    bun) printf 'bun run bun/client.js --rendezvous=127.0.0.1:%s --service=%s' "$2" "$3" ;;
-    python) printf 'python3 python/client.py --rendezvous 127.0.0.1:%s --service %s' "$2" "$3" ;;
-    php) printf 'php php/client.php --rendezvous=127.0.0.1:%s --service=%s' "$2" "$3" ;;
+    go) printf '"%s/go/%s/client" --rendezvous 127.0.0.1:%s --service %s' "$DIST" "$GO_DIST_ARCH" "$2" "$3" ;;
+    bun) printf 'bun "%s/bun/client.js" --rendezvous=127.0.0.1:%s --service=%s' "$DIST" "$2" "$3" ;;
+    python) printf 'python3 "%s/python/client.py" --rendezvous 127.0.0.1:%s --service %s' "$DIST" "$2" "$3" ;;
+    php) printf 'php "%s/php/client.php" --rendezvous=127.0.0.1:%s --service=%s' "$DIST" "$2" "$3" ;;
   esac
 }
 
@@ -37,7 +45,7 @@ test_pair() {
   local rdv
   local output
 
-  .tmpbin/rendezvous --listen ":${port}" >"/tmp/rshell-rdv-${port}.log" 2>&1 &
+  "$DIST/go/$GO_DIST_ARCH/rendezvous" --listen ":${port}" >"/tmp/rshell-rdv-${port}.log" 2>&1 &
   rdv=$!
   sleep 0.4
   bash -lc "$(host_cmd "$host_lang" "$port" "$service")" >"/tmp/rshell-host-${port}.log" 2>&1 &
